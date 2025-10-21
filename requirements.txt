@@ -1,0 +1,10 @@
+fastapi 
+uvicorn  
+pymongo
+geopy
+requests
+beautifulsoup4
+pandas
+streamlit
+selenium
+webdriver-manager

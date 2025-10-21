@@ -5,6 +5,10 @@ from scrapers import scrape_jobs, scrape_accommodations
 from database import save_listings, get_listings, update_listing, get_db
 import uuid
 import logging
+import threading
+import queue
+import time
+import urllib.parse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +42,22 @@ st.title("Locator - Australia 🇦🇺")
 categories = ["accommodation", "part-time", "professional", "aged-care"]
 tab_names = ["Search", "🏠 Rooms/Accommodation", "💼 Part-Time Jobs", "💻 Professional Jobs", "❤️ Aged Care Jobs"]
 
+# Initialize session state for scraping status
+if 'scraping_thread' not in st.session_state:
+    st.session_state.scraping_thread = None
+if 'scraping_complete' not in st.session_state:
+    st.session_state.scraping_complete = False
+if 'scraping_results' not in st.session_state:
+    st.session_state.scraping_results = []
+if 'scraping_status' not in st.session_state:
+    st.session_state.scraping_status = ""
+if 'scraping_progress' not in st.session_state:
+    st.session_state.scraping_progress = 0
+if 'scraping_error' not in st.session_state:
+    st.session_state.scraping_error = None
+if 'start_address' not in st.session_state:
+    st.session_state.start_address = ""
+
 tabs = st.tabs(tab_names)
 
 def apply_filters(df, filters):
@@ -45,23 +65,20 @@ def apply_filters(df, filters):
     filtered_df = df.copy()
     for column, value in filters.items():
         if value:
-            if column in ["title", "location", "source", "company", "price", "keyword"]:
+            if column in ["title", "location", "source", "company", "price", "keyword", "map", "distance"]:
                 filtered_df = filtered_df[filtered_df[column].str.contains(value, case=False, na=False)]
             elif column in ["posted_date", "deadline_date", "status"]:
                 filtered_df = filtered_df[filtered_df[column].astype(str).str.contains(value, case=False, na=False)]
     return filtered_df
 
-def run_scraping(category, address, radius, keyword, custom_url, collection):
-    """Run scraping and update progress in the main thread."""
+def run_scraping(category, address, radius, keyword, custom_url, collection, progress_queue):
+    """Run scraping in a background thread and send updates via queue."""
     lat, lon, city = get_coordinates(address)
     if not lat or not lon:
         logger.warning(f"Geocoding failed for address: {address}. Defaulting to Sydney NSW.")
         lat, lon, city = get_coordinates("Sydney NSW")
     
     results = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
     if category == "accommodation":
         scraper = scrape_accommodations(address, radius, lat, lon, city, custom_url)
     else:
@@ -69,13 +86,12 @@ def run_scraping(category, address, radius, keyword, custom_url, collection):
 
     try:
         for update in scraper:
-            progress_bar.progress(update["progress"])
-            status_text.write(update["status"])
+            progress_queue.put(update)
             if "results" in update:
                 results = update["results"]
     except Exception as e:
         logger.error(f"Scraping failed: {e}")
-        status_text.error(f"Error during scraping: {e}")
+        progress_queue.put({"status": f"Error during scraping: {e}", "progress": 0, "error": True})
         return
 
     unique_results = {res['link']: res for res in results if 'link' in res}.values()
@@ -84,23 +100,75 @@ def run_scraping(category, address, radius, keyword, custom_url, collection):
         for res in unique_results:
             res["category"] = category
             res["status"] = res.get("status", "new")
-            # Ensure keyword is saved
+            res["distance"] = "N/A"  # Set default distance value
             if keyword:
                 res["keyword"] = keyword
-        try:
-            save_listings(collection, list(unique_results))
-            st.session_state.scraping_results = list(unique_results)
-        except Exception as e:
-            logger.error(f"Failed to save listings to database: {e}")
-            status_text.error(f"Failed to save results to database: {e}")
+        progress_queue.put({"status": "Results processed", "progress": 1.0, "results": list(unique_results)})
     else:
         logger.warning("No results found during scraping.")
-        st.session_state.scraping_results = []
+        progress_queue.put({"status": "No results found", "progress": 1.0, "results": []})
 
+    progress_queue.put({"status": "Completed", "progress": 1.0})
+
+def start_scraping(category, address, radius, keyword, custom_url, collection):
+    """Start scraping in a background thread."""
+    if st.session_state.scraping_thread and st.session_state.scraping_thread.is_alive():
+        st.session_state.scraping_error = "Another search is already in progress"
+        return
+    progress_queue = queue.Queue()
+    st.session_state.scraping_complete = False
+    st.session_state.scraping_results = []
+    st.session_state.scraping_status = "Starting search..."
+    st.session_state.scraping_progress = 0
+    st.session_state.scraping_error = None
+    st.session_state.scraping_thread = threading.Thread(
+        target=run_scraping,
+        args=(category, address, radius, keyword, custom_url, collection, progress_queue)
+    )
+    st.session_state.scraping_thread.start()
+    return progress_queue
+
+def update_ui(progress_queue):
+    """Update the UI with the latest scraping status from the queue."""
+    progress_bar = st.empty()
+    status_text = st.empty()
+    while st.session_state.scraping_thread and st.session_state.scraping_thread.is_alive():
+        try:
+            update = progress_queue.get_nowait()
+            st.session_state.scraping_progress = update.get("progress", 0)
+            st.session_state.scraping_status = update.get("status", "")
+            if update.get("error"):
+                st.session_state.scraping_error = update["status"]
+            if "results" in update:
+                st.session_state.scraping_results = update["results"]
+            progress_bar.progress(st.session_state.scraping_progress)
+            status_text.text(st.session_state.scraping_status)
+            if st.session_state.scraping_error:
+                status_text.error(st.session_state.scraping_error)
+        except queue.Empty:
+            progress_bar.progress(st.session_state.scraping_progress)
+            status_text.text(st.session_state.scraping_status)
+            if st.session_state.scraping_error:
+                status_text.error(st.session_state.scraping_error)
+            time.sleep(0.1)  # Wait briefly before checking again
+    # Check for final updates after thread completes
+    while not progress_queue.empty():
+        update = progress_queue.get()
+        st.session_state.scraping_progress = update.get("progress", 0)
+        st.session_state.scraping_status = update.get("status", "")
+        if update.get("error"):
+            st.session_state.scraping_error = update["status"]
+        if "results" in update:
+            st.session_state.scraping_results = update["results"]
+        progress_bar.progress(st.session_state.scraping_progress)
+        status_text.text(st.session_state.scraping_status)
+        if st.session_state.scraping_error:
+            status_text.error(st.session_state.scraping_error)
     st.session_state.scraping_complete = True
 
 with tabs[0]:
     address = st.text_input("Enter your address (e.g., 123 Pitt St, Sydney NSW)")
+    st.session_state.start_address = st.text_input("Enter start address for map directions (e.g., 456 King St, Melbourne VIC)")
     radius = st.slider("Radius (km)", 5, 50, 10)
     category_select = st.selectbox("Category", tab_names[1:])
     keyword = st.text_input("Additional keyword (optional)")
@@ -109,131 +177,113 @@ with tabs[0]:
     if st.button("Search with Locator"):
         category = categories[tab_names.index(category_select) - 1]
         collection = "accommodations" if category == "accommodation" else "jobs"
-        st.session_state.scraping_progress = 0
-        st.session_state.scraping_status = "Starting search..."
-        st.session_state.scraping_complete = False
-        st.session_state.scraping_results = []
+        progress_queue = start_scraping(category, address, radius, keyword, custom_url, collection)
 
-        # Run scraping in the main thread
-        run_scraping(category, address, radius, keyword, custom_url, collection)
+        # Update UI with scraping progress
+        if progress_queue:
+            update_ui(progress_queue)
 
     # Display results if complete
-    if 'scraping_complete' in st.session_state and st.session_state.scraping_complete:
+    if st.session_state.scraping_complete and st.session_state.scraping_results:
         results = st.session_state.scraping_results
-        if results:
-            df = pd.DataFrame(results)
-            # Updated columns to include keyword
-            columns = ["title", "company" if collection == "jobs" else "price", "location", 
-                      "keyword", "source", "posted_date", "deadline_date", "status", "link"]
-            available_columns = [col for col in columns if col in df.columns]
-            df = df[available_columns]
+        df = pd.DataFrame(results)
+        columns = ["title", "company" if collection == "jobs" else "price", "location",
+                   "keyword", "source", "posted_date", "deadline_date", "status", "distance", "link"]
+        available_columns = [col for col in columns if col in df.columns]
+        df = df[available_columns]
 
-            # Add filters
-            st.subheader("Filter Results")
-            filters = {}
-            cols = st.columns(len(available_columns))
-            for idx, col in enumerate(available_columns):
-                with cols[idx]:
-                    filters[col] = st.text_input(f"Filter {col.replace('_', ' ').title()}", key=f"filter_{col}")
+        # Add Map column with Google Maps URL using start_address and appending ", Adelaide SA" to destination
+        start_address = st.session_state.start_address or "N/A"
+        df['map'] = df['location'].apply(
+            lambda x: f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(start_address)}&destination={urllib.parse.quote(str(x) + ', Adelaide SA' if isinstance(x, str) else 'N/A, Adelaide SA')}"
+        )
+        available_columns.append('map')
 
-            # Apply filters
-            filtered_df = apply_filters(df, filters)
+        # Add filters
+        st.subheader("Filter Results")
+        filters = {}
+        cols = st.columns(len(available_columns))
+        for idx, col in enumerate(available_columns):
+            with cols[idx]:
+                filters[col] = st.text_input(f"Filter {col.replace('_', ' ').title()}", key=f"filter_{col}")
 
-            # Display editable table
-            st.subheader("Search Results")
-            try:
-                column_config = {
-                    "link": st.column_config.LinkColumn("Link", display_text="Open"),
-                    "title": st.column_config.TextColumn("Title", width="large"),
-                    "company": st.column_config.TextColumn("Company", width="medium"),
-                    "price": st.column_config.TextColumn("Price", width="medium"),
-                    "location": st.column_config.TextColumn("Location", width="medium"),
-                    "keyword": st.column_config.TextColumn("Keyword", width="medium"),
-                    "source": st.column_config.TextColumn("Source", width="medium"),
-                    "posted_date": st.column_config.TextColumn("Posted Date", width="medium"),
-                    "deadline_date": st.column_config.TextColumn("Deadline Date", width="medium"),
-                    "status": st.column_config.TextColumn("Status", width="medium"),
-                }
-                
-                edited_df = st.data_editor(
-                    filtered_df,
-                    width="stretch",
-                    column_config={k: v for k, v in column_config.items() if k in available_columns},
-                    num_rows="dynamic",
-                    key=f"editor_{category}"
-                )
+        # Apply filters
+        filtered_df = apply_filters(df, filters)
 
-                # Save edited rows to database
-                if st.button("Save Changes", key=f"save_{category}"):
-                    try:
-                        # Create a copy of edited_df to modify
-                        updated_df = edited_df.copy()
-                        
-                        for idx, row in updated_df.iterrows():
-                            row_data = row.to_dict()
-                            
-                            # Handle new rows
-                            if "link" not in row_data or not row_data.get("link"):
-                                # Generate unique link for new row
-                                new_link = str(uuid.uuid4())
-                                updated_df.at[idx, "link"] = new_link
-                                row_data["link"] = new_link
-                                # Set default values for required fields
-                                row_data["category"] = category
-                                row_data["status"] = row_data.get("status", "new")
-                                row_data["title"] = row_data.get("title", "")
-                                row_data["location"] = row_data.get("location", "")
-                                row_data["source"] = row_data.get("source", "")
-                                row_data["posted_date"] = row_data.get("posted_date", "")
-                                row_data["deadline_date"] = row_data.get("deadline_date", "")
-                                row_data["keyword"] = row_data.get("keyword", "")
-                                if collection == "jobs":
-                                    row_data["company"] = row_data.get("company", "")
-                                else:
-                                    row_data["price"] = row_data.get("price", "")
-                            
-                            # Check if row exists in original DataFrame
-                            original_row = df[df["link"] == row_data["link"]].iloc[0] if not df[df["link"] == row_data["link"]].empty else None
-                            if original_row is not None and not pd.Series(row_data).equals(original_row):
-                                # Update existing row
-                                update_listing(collection, row_data["link"], row_data)
-                                logger.info(f"Updated row with link: {row_data['link']}")
-                            elif original_row is None:
-                                # Insert new row
-                                try:
-                                    update_listing(collection, row_data["link"], row_data)
-                                    logger.info(f"Inserted new row with link: {row_data['link']}")
-                                except Exception as e:
-                                    logger.error(f"Failed to insert new row with link {row_data['link']}: {e}")
-                                    st.error(f"Failed to insert new row: {e}")
-                        
-                        # Handle deleted rows
-                        original_links = set(df["link"])
-                        edited_links = set(updated_df["link"])
-                        deleted_links = original_links - edited_links
-                        for deleted_link in deleted_links:
-                            db = get_db()
-                            db_collection = db[collection]
-                            db_collection.delete_one({"link": deleted_link})
-                            logger.info(f"Deleted row with link: {deleted_link}")
-                        
-                        # Update session state to reflect changes
-                        st.session_state.scraping_results = updated_df.to_dict("records")
-                        st.success("Changes saved to database!")
-                    except Exception as e:
-                        logger.error(f"Error saving changes to database: {e}")
-                        st.error(f"Error saving changes: {e}")
-            except Exception as e:
-                logger.error(f"Error displaying data editor: {e}")
-                st.error(f"Error displaying results: {e}")
-        else:
-            st.error("No results found")
+        # Display total row count
+        st.write(f"**Total Results: {len(filtered_df)}**")
+
+        # Display editable table
+        st.subheader("Search Results")
+        try:
+            column_config = {
+                "link": st.column_config.LinkColumn("Link", display_text="Open"),
+                "title": st.column_config.TextColumn("Title", width="large"),
+                "company": st.column_config.TextColumn("Company", width="medium"),
+                "price": st.column_config.TextColumn("Price", width="medium"),
+                "location": st.column_config.TextColumn("Location", width="medium"),
+                "keyword": st.column_config.TextColumn("Keyword", width="medium"),
+                "source": st.column_config.TextColumn("Source", width="medium"),
+                "posted_date": st.column_config.TextColumn("Posted Date", width="medium"),
+                "deadline_date": st.column_config.TextColumn("Deadline Date", width="medium"),
+                "status": st.column_config.TextColumn("Status", width="medium"),
+                "distance": st.column_config.TextColumn("Distance", width="medium"),
+                "map": st.column_config.LinkColumn("Map", display_text="View Map", width="small")
+            }
+            
+            edited_df = st.data_editor(
+                filtered_df,
+                width="stretch",
+                column_config={k: v for k, v in column_config.items() if k in available_columns},
+                num_rows="dynamic",
+                key=f"editor_{category}",
+                disabled=["map"]  # Prevent editing of map column
+            )
+
+            # Save edited rows to database
+            if st.button("Save Changes", key=f"save_{category}"):
+                try:
+                    for idx, row in edited_df.iterrows():
+                        row_data = row.to_dict()
+                        if "link" not in row_data or not row_data.get("link"):
+                            new_link = str(uuid.uuid4())
+                            edited_df.at[idx, "link"] = new_link
+                            row_data["link"] = new_link
+                            row_data["category"] = category
+                            row_data["status"] = row_data.get("status", "new")
+                            row_data["distance"] = row_data.get("distance", "N/A")
+                            row_data["title"] = row_data.get("title", "N/A")
+                            row_data["location"] = row_data.get("location", "N/A")
+                            row_data["source"] = row_data.get("source", "N/A")
+                            row_data["posted_date"] = row_data.get("posted_date", None)
+                            row_data["deadline_date"] = row_data.get("deadline_date", None)
+                            row_data["keyword"] = row_data.get("keyword", keyword or "N/A")
+                            if collection == "jobs":
+                                row_data["company"] = row_data.get("company", "N/A")
+                            else:
+                                row_data["price"] = row_data.get("price", "N/A")
+                        update_listing(collection, row_data["link"], row_data)
+                    st.success("Changes saved to database!")
+                except Exception as e:
+                    logger.error(f"Error saving changes to database: {e}")
+                    st.error(f"Error saving changes: {e}")
+        except Exception as e:
+            logger.error(f"Error displaying data editor: {e}")
+            st.error(f"Error displaying results: {e}")
+    elif st.session_state.scraping_complete:
+        st.error("No results found")
 
 # Category tabs showing DB data
 for i in range(1, 5):
     with tabs[i]:
         category = categories[i-1]
         collection = "accommodations" if category == "accommodation" else "jobs"
+
+        # Add Refresh button
+        if st.button("Refresh", key=f"refresh_{category}"):
+            st.session_state[f"refresh_trigger_{category}"] = True
+
+        # Fetch listings from database
         try:
             listings = get_listings(collection, {"category": category})
         except Exception as e:
@@ -243,11 +293,21 @@ for i in range(1, 5):
         
         if listings:
             df = pd.DataFrame(listings)
-            # Updated columns to include keyword
-            columns = ["title", "company" if collection == "jobs" else "price", "location", 
-                      "keyword", "source", "posted_date", "deadline_date", "status", "link", "scraped_at"]
+            columns = ["title", "company" if collection == "jobs" else "price", "location",
+                       "keyword", "source", "posted_date", "deadline_date", "status", "distance", "link"]
             available_columns = [col for col in columns if col in df.columns]
             df = df[available_columns]
+
+            # Ensure distance column exists
+            if 'distance' not in df.columns:
+                df['distance'] = "N/A"
+
+            # Add Map column with Google Maps URL using start_address and appending ", Adelaide SA" to destination
+            start_address = st.session_state.start_address or "N/A"
+            df['map'] = df['location'].apply(
+                lambda x: f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(start_address)}&destination={urllib.parse.quote(str(x) + ', Adelaide SA' if isinstance(x, str) else 'N/A, Adelaide SA')}"
+            )
+            available_columns.append('map')
 
             # Add filters
             st.subheader(f"Filter {tab_names[i]}")
@@ -259,6 +319,9 @@ for i in range(1, 5):
 
             # Apply filters
             filtered_df = apply_filters(df, filters)
+
+            # Display total row count
+            st.write(f"**Total {tab_names[i]}: {len(filtered_df)}**")
 
             # Display editable table
             st.subheader(f"{tab_names[i]} Results")
@@ -274,7 +337,8 @@ for i in range(1, 5):
                     "posted_date": st.column_config.TextColumn("Posted Date", width="medium"),
                     "deadline_date": st.column_config.TextColumn("Deadline Date", width="medium"),
                     "status": st.column_config.TextColumn("Status", width="medium"),
-                    "scraped_at": st.column_config.DatetimeColumn("Scraped At", width="medium"),
+                    "distance": st.column_config.TextColumn("Distance", width="medium"),
+                    "map": st.column_config.LinkColumn("Map", display_text="View Map", width="small")
                 }
                 
                 edited_df = st.data_editor(
@@ -282,46 +346,38 @@ for i in range(1, 5):
                     width="stretch",
                     column_config={k: v for k, v in column_config.items() if k in available_columns},
                     num_rows="dynamic",
-                    key=f"editor_{category}_db"
+                    key=f"editor_{category}_db",
+                    disabled=["map"]  # Prevent editing of map column
                 )
 
                 # Save edited rows to database
                 if st.button("Save Changes", key=f"save_{category}_db"):
                     try:
-                        # Create a copy of edited_df to modify
                         updated_df = edited_df.copy()
-                        
                         for idx, row in updated_df.iterrows():
                             row_data = row.to_dict()
-                            
-                            # Handle new rows
                             if "link" not in row_data or not row_data.get("link"):
-                                # Generate unique link for new row
                                 new_link = str(uuid.uuid4())
                                 updated_df.at[idx, "link"] = new_link
                                 row_data["link"] = new_link
-                                # Set default values for required fields
                                 row_data["category"] = category
                                 row_data["status"] = row_data.get("status", "new")
-                                row_data["title"] = row_data.get("title", "")
-                                row_data["location"] = row_data.get("location", "")
-                                row_data["source"] = row_data.get("source", "")
-                                row_data["posted_date"] = row_data.get("posted_date", "")
-                                row_data["deadline_date"] = row_data.get("deadline_date", "")
-                                row_data["keyword"] = row_data.get("keyword", "")
+                                row_data["distance"] = row_data.get("distance", "N/A")
+                                row_data["title"] = row_data.get("title", "N/A")
+                                row_data["location"] = row_data.get("location", "N/A")
+                                row_data["source"] = row_data.get("source", "N/A")
+                                row_data["posted_date"] = row_data.get("posted_date", None)
+                                row_data["deadline_date"] = row_data.get("deadline_date", None)
+                                row_data["keyword"] = row_data.get("keyword", "N/A")
                                 if collection == "jobs":
-                                    row_data["company"] = row_data.get("company", "")
+                                    row_data["company"] = row_data.get("company", "N/A")
                                 else:
-                                    row_data["price"] = row_data.get("price", "")
-                            
-                            # Check if row exists in original DataFrame
+                                    row_data["price"] = row_data.get("price", "N/A")
                             original_row = df[df["link"] == row_data["link"]].iloc[0] if not df[df["link"] == row_data["link"]].empty else None
                             if original_row is not None and not pd.Series(row_data).equals(original_row):
-                                # Update existing row
                                 update_listing(collection, row_data["link"], row_data)
                                 logger.info(f"Updated row with link: {row_data['link']}")
                             elif original_row is None:
-                                # Insert new row
                                 try:
                                     update_listing(collection, row_data["link"], row_data)
                                     logger.info(f"Inserted new row with link: {row_data['link']}")
@@ -329,7 +385,6 @@ for i in range(1, 5):
                                     logger.error(f"Failed to insert new row with link {row_data['link']}: {e}")
                                     st.error(f"Failed to insert new row: {e}")
                         
-                        # Handle deleted rows
                         original_links = set(df["link"])
                         edited_links = set(updated_df["link"])
                         deleted_links = original_links - edited_links

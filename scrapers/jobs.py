@@ -8,13 +8,7 @@ from selenium.webdriver.support import expected_conditions as EC
 import time
 from bs4 import BeautifulSoup
 from geocode import filter_by_radius, get_coordinates
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.options import Options
-from bs4 import BeautifulSoup
-import time
+from database import update_listing, get_db
 
 def get_driver():
     """Initialize and return a Selenium WebDriver."""
@@ -40,6 +34,9 @@ def scroll_and_get_source(driver, url, scrolls=3):
 def scrape_seek(location, radius_km, keywords, category, lat, lon, city="", max_pages=20):
     """
     Scrape job listings from SEEK for a fixed number of pages (default 20).
+    Saves jobs to the database as they are found to avoid losing progress.
+    Avoids saving duplicate jobs by checking job links in the database.
+    Uses 'N/A' for missing fields (except link) instead of skipping jobs.
 
     Args:
         location (str): Location for job search (e.g., "All Adelaide SA").
@@ -52,14 +49,33 @@ def scrape_seek(location, radius_km, keywords, category, lat, lon, city="", max_
         max_pages (int): Maximum number of pages to scrape (default 20).
 
     Returns:
-        list: List of job dictionaries, including the keyword used for each job.
+        list: List of unique job dictionaries, including the keyword used for each job.
     """
     driver = get_driver()
     all_jobs = []
+    seen_links = set()  # To track unique job links within this session
+    db = get_db()
+    collection = db["jobs"]
 
     # Define additional keywords for categories
     category_keywords = {
-        "part-time": ["warehouse"],
+        "part-time": [
+            "part time", "casual", "student", "urgent", "cash", "assistant", "helper", "temporary", "seasonal", "flexible hours", "evening shift", "weekend",
+            "retail", "shop assistant", "sales assistant", "assistant", "store associate", "shop floor", "merchandise assistant", "supermarket", "cashier", "floor staff", "sales representative",
+            "customer service", "front counter", "checkout", "store clerk", "retail support", "retail associate",
+            "warehouse", "packer", "packaging", "labour", "loading", "unloading", "delivery driver", "courier", "driver", "van driver", "driver", "forklift",
+            "logistics assistant", "warehouse operator", "material handler", "inventory", "receiving", "shipping", "stocking", "goods handling", "picker", "packer operator",
+            "fulfillment", "warehouse packing", "warehouse staff", "distribution", "supply chain", "logistics",
+            "cleaner", "cleaning", "housekeeping", "janitor", "groundskeeper", "maintenance assistant", "gardener", "maintenance", "facility support", "cleaning staff", "commercial cleaning",
+            "office cleaning", "industrial cleaning", "floor cleaning", "sanitation",
+            "office assistant", "admin assistant", "clerical", "office support", "data entry", "data processing", "customer support", "phone operator", "front desk", "document processing",
+            "receptionist", "administration", "admin support", "call centre", "helpdesk", "office clerk", "virtual assistant", "remote work", "telemarketing", "back office",
+            "event staff", "event assistant", "promoter", "brand ambassador", "usher", "ticketing", "casual staff", "temporary staff", "festival work", "promotional work", "roadshow",
+            "exhibition", "conference staff", "hospitality casual", "staffing agency", "temp job", "marketing assistant",
+            "childcare", "after school", "nanny", "babysitter", "au pair", "playgroup assistant", "daycare support", "preschool assistant",
+            "labourer", "handyman", "delivery", "courier service", "pet care", "dog walker", "cleaning helper", "retail helper", "packing assistant", "stock assistant", "assistant worker",
+            "general helper", "general labour", "warehouse helper", "store helper", "casual helper", "assistant packer"
+        ],
         "professional": ["IT professional", "software engineer", "developer", "programmer"],
         "aged-care": ["aged care", "nursing", "care assistant"]
     }
@@ -97,13 +113,42 @@ def scrape_seek(location, radius_km, keywords, category, lat, lon, city="", max_
             jobs_found = 0
             for job in soup.find_all("article", {"data-automation": "normalJob"}):
                 try:
-                    title = job.find("a", {"data-automation": "jobTitle"}).text.strip()
-                    link = "https://www.seek.com.au" + job.find("a")["href"]
-                    company = job.find("a", {"data-automation": "jobCompany"}).text.strip()
-                    loc = job.find("a", {"data-automation": "jobLocation"}).text.strip()
-                    posted = job.find("span", {"data-automation": "jobListingDate"}).text.strip() if job.find("span", {"data-automation": "jobListingDate"}) else None
+                    # Get job link
+                    link_elem = job.find("a")
+                    if not link_elem or "href" not in link_elem.attrs:
+                        print(f"Skipping job with missing link on page {page}, keyword {kw}")
+                        continue
+                    link = "https://www.seek.com.au" + link_elem["href"]
+                    
+                    # Check for duplicate in database
+                    if collection.find_one({"link": link}):
+                        print(f"Duplicate job found in database (link: {link}). Skipping.")
+                        continue
+                    
+                    # Check for duplicate in current session
+                    if link in seen_links:
+                        print(f"Duplicate job found in session (link: {link}). Skipping.")
+                        continue
+
+                    # Get job title
+                    title_elem = job.find("a", {"data-automation": "jobTitle"})
+                    title = title_elem.text.strip() if title_elem else "N/A"
+                    
+                    # Get company
+                    company_elem = job.find("a", {"data-automation": "jobCompany"})
+                    company = company_elem.text.strip() if company_elem else "N/A"
+                    
+                    # Get location
+                    loc_elem = job.find("a", {"data-automation": "jobLocation"})
+                    loc = loc_elem.text.strip() if loc_elem else "N/A"
+                    
+                    # Get posted date
+                    posted_elem = job.find("span", {"data-automation": "jobListingDate"})
+                    posted = posted_elem.text.strip() if posted_elem else None
                     deadline = None
-                    all_jobs.append({
+                    
+                    # Create job dictionary
+                    job_data = {
                         "title": title,
                         "company": company,
                         "link": link,
@@ -112,8 +157,20 @@ def scrape_seek(location, radius_km, keywords, category, lat, lon, city="", max_
                         "posted_date": posted,
                         "deadline_date": deadline,
                         "status": "new",
-                        "keyword": kw  # Add keyword to track which search term found this job
-                    })
+                        "keyword": kw,
+                        "category": category
+                    }
+                    
+                    # Save job to database immediately
+                    try:
+                        update_listing("jobs", link, job_data)
+                        print(f"Saved job to database: {title} (link: {link})")
+                    except Exception as e:
+                        print(f"Error saving job to database (link: {link}): {e}")
+                        continue
+                    
+                    all_jobs.append(job_data)
+                    seen_links.add(link)
                     jobs_found += 1
                 except Exception as e:
                     print(f"Error processing job on page {page}, keyword {kw}: {e}")
@@ -131,726 +188,65 @@ def scrape_seek(location, radius_km, keywords, category, lat, lon, city="", max_
     driver.quit()
     return all_jobs
 
-def scrape_indeed(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://au.indeed.com/jobs?q={base_keywords.replace(' ', '+')}&l={location.replace(' ', '+')}&radius={radius_km}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="jobsearch-SerpJobCard"):
-        try:
-            title = job.find("h2", class_="title").text.strip()
-            link = "https://au.indeed.com" + job.find("a", class_="jobtitle")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Indeed", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_jora(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://au.jora.com/{base_keywords.replace(' ', '-')}-jobs-in-{location.replace(' ', '-')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job-card"):
-        try:
-            title = job.find("h2", class_="job-title").text.strip()
-            link = "https://au.jora.com" + job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Jora", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_linkedin(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.linkedin.com/jobs/search/?keywords={base_keywords.replace(' ', '%20')}&location={location.replace(' ', '%20')}&distance={radius_km}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("li", class_="job-result-card"):
-        try:
-            title = job.find("h3", class_="job-result-card__title").text.strip()
-            link = job.find("a", class_="result-card__full-card-link")["href"]
-            company = job.find("h4", class_="job-result-card__subtitle").text.strip()
-            loc = job.find("span", class_="job-result-card__location").text.strip()
-            posted = job.find("time", class_="job-result-card__posted-date").text.strip() if job.find("time", class_="job-result-card__posted-date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "LinkedIn", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_glassdoor(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.glassdoor.com.au/Job/{base_keywords.replace(' ', '-')}-jobs-SRCH_KO0,{len(base_keywords.replace(' ', '-'))}_IL.0,{len(location.replace(' ', '-'))}_IP{location.replace(' ', '-')}.htm?radius={radius_km}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("li", class_="jobListing"):
-        try:
-            title = job.find("a", class_="jobLink").text.strip()
-            link = job.find("a", class_="jobLink")["href"]
-            company = job.find("div", class_="jobEmp").text.strip()
-            loc = job.find("span", class_="jobLoc").text.strip()
-            posted = job.find("span", class_="jobDate").text.strip() if job.find("span", class_="jobDate") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Glassdoor", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_careerone(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.careerone.com.au/{base_keywords.replace(' ', '-')}-jobs/in-{location.replace(' ', '-')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h2").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "CareerOne", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_adzuna(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.adzuna.com.au/search?loc={location.replace(' ', '+')}&q={base_keywords.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job-card"):
-        try:
-            title = job.find("h2").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Adzuna", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_apsjobs(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.apsjobs.gov.au/s/search-jobs?query={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="agency").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "APSJobs", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_jobsvic(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://jobs.vic.gov.au/jobs?query={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="department").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "JobsVIC", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_smartjobs(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://smartjobs.qld.gov.au/jobs?query={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="department").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "SmartJobs", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_jobswa(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://jobs.wa.gov.au/jobs?query={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="department").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "JobsWA", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_ethicaljobs(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.ethicaljobs.com.au/jobs?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="organisation").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "EthicalJobs", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_backpacker(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.backpackerjobboard.com.au/jobs/{base_keywords.replace(' ', '-')}-in-{location.replace(' ', '-')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Backpacker", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_medicaljobs(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.medicaljobs.com.au/jobs/{base_keywords.replace(' ', '-')}-in-{location.replace(' ', '-')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "MedicalJobs", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_artshub(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.artshub.com.au/jobs/search?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "ArtsHub", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_flexcareers(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.flexcareers.com.au/jobs/search?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "FlexCareers", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_gradconnection(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://au.gradconnection.com/jobs/search?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "GradConnection", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_probono(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://probonoaustralia.com.au/jobs/search?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "ProBono", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_workfast(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.workfast.com.au/jobs/search?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Workfast", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_talent(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://au.talent.com/jobs?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Talent", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_applynow(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.applynow.com.au/jobs/search?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "ApplyNow", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_simplyhired(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.simplyhired.com.au/search?q={base_keywords.replace(' ', '+')}&l={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "SimplyHired", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_nrmjobs(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.nrmjobs.com.au/jobs/search?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "NRMJobs", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_careerjet(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.careerjet.com.au/search/jobs?s={base_keywords.replace(' ', '+')}&l={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "CareerJet", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_grabjobs(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://grabjobs.co/au/jobs?keywords={base_keywords.replace(' ', '+')}&location={location.replace(' ', '+')}"
-    soup = scroll_and_get_source(driver, url, 2)
-    jobs = []
-    for job in soup.find_all("div", class_="job"):
-        try:
-            title = job.find("h3").text.strip()
-            link = job.find("a")["href"]
-            company = job.find("span", class_="company").text.strip()
-            loc = job.find("span", class_="location").text.strip()
-            posted = job.find("span", class_="date").text.strip() if job.find("span", class_="date") else None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "GrabJobs", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_facebook_jobs(location, radius_km, keywords, category, lat, lon, city):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.facebook.com/marketplace/{city.replace(' ', '-')}/jobs?query={base_keywords.replace(' ', '+')}&radius={radius_km}"
-    soup = scroll_and_get_source(driver, url, 4)
-    jobs = []
-    for job in soup.find_all("div", class_="x9f619"):
-        try:
-            title = job.find("span", class_="x1lliihq").text.strip()
-            link = "https://www.facebook.com" + job.find("a")["href"]
-            company = "Facebook User"
-            loc = location
-            posted = None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Facebook", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_instagram_jobs(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.instagram.com/explore/search/keyword/?q={base_keywords.replace(' ', '%20')}%20jobs%20{location.replace(' ', '%20')}"
-    soup = scroll_and_get_source(driver, url, 5)
-    jobs = []
-    for job in soup.find_all("div", class_="x9f619"):
-        try:
-            title = job.find("span", class_="x1lliihq").text.strip()
-            link = "https://www.instagram.com" + job.find("a")["href"]
-            company = "Instagram User"
-            loc = location
-            posted = None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Instagram", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
-def scrape_tiktok_jobs(location, radius_km, keywords, category, lat, lon, city=""):
-    driver = get_driver()
-    base_keywords = keywords
-    if category == "part-time":
-        base_keywords += " part time casual student"
-    elif category == "professional":
-        base_keywords += " IT professional"
-    elif category == "aged-care":
-        base_keywords = "aged care " + base_keywords
-    url = f"https://www.tiktok.com/search?q={base_keywords.replace(' ', '%20')}%20jobs%20{location.replace(' ', '%20')}"
-    soup = scroll_and_get_source(driver, url, 5)
-    jobs = []
-    for job in soup.find_all("div", class_="tiktok-1qd04g-DivItemContainerV2"):
-        try:
-            title = job.find("div", class_="tiktok-1p23jpt-DivText").text.strip()
-            link = "https://www.tiktok.com" + job.find("a")["href"]
-            company = "TikTok User"
-            loc = location
-            posted = None
-            deadline = None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "TikTok", "posted_date": posted, "deadline_date": deadline, "status": "new"})
-        except Exception:
-            continue
-    driver.quit()
-    return filter_by_radius(jobs, lat, lon, radius_km)
-
 def scrape_custom(url, category, city=""):
     driver = get_driver()
     soup = scroll_and_get_source(driver, url, 2)
     jobs = []
+    db = get_db()
+    collection = db["jobs"]
+
     for job in soup.find_all("div", class_="post") or soup.find_all("li", class_="item"):
         try:
-            title = job.find("h2") or job.find("a")
-            title = title.text.strip() if title else "N/A"
-            link = job.find("a")["href"] if job.find("a") else url
-            company = job.find("span", class_="company") or job.find("div", class_="employer")
-            company = company.text.strip() if company else "N/A"
-            loc = job.find("span", class_="location") or "N/A"
-            loc = loc.text.strip() if loc else "N/A"
-            posted = job.find("time") or job.find("span", class_="date")
-            posted = posted.get("datetime") or posted.text.strip() if posted else None
-            deadline = job.find("span", class_="deadline") or None
-            deadline = deadline.text.strip() if deadline else None
-            jobs.append({"title": title, "company": company, "link": link, "location": loc, "source": "Custom", "posted_date": posted, "deadline_date": deadline, "status": "new"})
+            # Get job link
+            link_elem = job.find("a")
+            link = link_elem["href"] if link_elem and "href" in link_elem.attrs else url
+            
+            # Check for duplicate in database
+            if collection.find_one({"link": link}):
+                print(f"Duplicate job found in database (link: {link}). Skipping.")
+                continue
+            
+            # Get title
+            title_elem = job.find("h2") or job.find("a")
+            title = title_elem.text.strip() if title_elem else "N/A"
+            
+            # Get company
+            company_elem = job.find("span", class_="company") or job.find("div", class_="employer")
+            company = company_elem.text.strip() if company_elem else "N/A"
+            
+            # Get location
+            loc_elem = job.find("span", class_="location") or job.find("div", class_="location")
+            loc = loc_elem.text.strip() if loc_elem else "N/A"
+            
+            # Get posted date
+            posted_elem = job.find("time") or job.find("span", class_="date")
+            posted = posted_elem.get("datetime") or posted_elem.text.strip() if posted_elem else None
+            
+            # Get deadline
+            deadline_elem = job.find("span", class_="deadline")
+            deadline = deadline_elem.text.strip() if deadline_elem else None
+            
+            job_data = {
+                "title": title,
+                "company": company,
+                "link": link,
+                "location": loc,
+                "source": "Custom",
+                "posted_date": posted,
+                "deadline_date": deadline,
+                "status": "new",
+                "category": category
+            }
+            
+            # Save job to database immediately
+            try:
+                update_listing("jobs", link, job_data)
+                print(f"Saved job to database: {title} (link: {link})")
+            except Exception as e:
+                print(f"Error saving job to database (link: {link}): {e}")
+                continue
+            
+            jobs.append(job_data)
         except Exception:
             continue
     driver.quit()
@@ -860,33 +256,6 @@ def scrape_jobs(location, radius_km, keywords, category, lat, lon, city, custom_
     all_jobs = []
     site_functions = [
         (scrape_seek, "Seek"),
-        # (scrape_indeed, "Indeed"),
-        # (scrape_jora, "Jora"),
-        # (scrape_linkedin, "LinkedIn"),
-        # (scrape_glassdoor, "Glassdoor"),
-        # (scrape_careerone, "CareerOne"),
-        # (scrape_adzuna, "Adzuna"),
-        # (scrape_apsjobs, "APSJobs"),
-        # (scrape_jobsvic, "JobsVIC"),
-        # (scrape_smartjobs, "SmartJobs"),
-        # (scrape_jobswa, "JobsWA"),
-        # (scrape_ethicaljobs, "EthicalJobs"),
-        # (scrape_backpacker, "Backpacker"),
-        # (scrape_medicaljobs, "MedicalJobs"),
-        # (scrape_artshub, "ArtsHub"),
-        # (scrape_flexcareers, "FlexCareers"),
-        # (scrape_gradconnection, "GradConnection"),
-        # (scrape_probono, "ProBono"),
-        # (scrape_workfast, "Workfast"),
-        # (scrape_talent, "Talent"),
-        # (scrape_applynow, "ApplyNow"),
-        # (scrape_simplyhired, "SimplyHired"),
-        # (scrape_nrmjobs, "NRMJobs"),
-        # (scrape_careerjet, "CareerJet"),
-        # (scrape_grabjobs, "GrabJobs"),
-        # (scrape_facebook_jobs, "Facebook"),
-        # (scrape_instagram_jobs, "Instagram"),
-        # (scrape_tiktok_jobs, "TikTok"),
     ]
     total_sites = len(site_functions) + (1 if custom_url else 0)
     for idx, (func, site_name) in enumerate(site_functions):

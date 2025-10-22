@@ -64,10 +64,12 @@ def apply_filters(df, filters):
     """Apply filters to the dataframe based on user input."""
     filtered_df = df.copy()
     for column, value in filters.items():
-        if value:
-            if column in ["title", "location", "source", "company", "price", "keyword", "map", "distance"]:
-                filtered_df = filtered_df[filtered_df[column].str.contains(value, case=False, na=False)]
-            elif column in ["posted_date", "deadline_date", "status"]:
+        if value:  # Only apply filter if a value is selected/entered
+            if column in ["keyword", "location", "source", "status"]:
+                # Exact match for dropdown filters
+                filtered_df = filtered_df[filtered_df[column] == value]
+            elif column in ["title", "company", "price", "posted_date", "deadline_date", "distance", "map"]:
+                # Partial match for text input filters
                 filtered_df = filtered_df[filtered_df[column].astype(str).str.contains(value, case=False, na=False)]
     return filtered_df
 
@@ -80,7 +82,7 @@ def run_scraping(category, address, radius, keyword, custom_url, collection, pro
     
     results = []
     if category == "accommodation":
-        scraper = scrape_accommodations(address, radius, lat, lon, city, custom_url)
+        scraper = scrape_accommodations(address, city, custom_url)
     else:
         scraper = scrape_jobs(address, radius, keyword, category, lat, lon, city, custom_url)
 
@@ -205,7 +207,20 @@ with tabs[0]:
         cols = st.columns(len(available_columns))
         for idx, col in enumerate(available_columns):
             with cols[idx]:
-                filters[col] = st.text_input(f"Filter {col.replace('_', ' ').title()}", key=f"filter_{col}")
+                if col in ["keyword", "location", "source", "status"]:
+                    # Dropdown filter with unique values
+                    unique_values = [""] + sorted(df[col].dropna().astype(str).unique().tolist())  # Include empty option
+                    filters[col] = st.selectbox(
+                        f"Filter {col.replace('_', ' ').title()}",
+                        options=unique_values,
+                        key=f"filter_{col}_search"
+                    )
+                else:
+                    # Text input for other columns
+                    filters[col] = st.text_input(
+                        f"Filter {col.replace('_', ' ').title()}",
+                        key=f"filter_{col}_search"
+                    )
 
         # Apply filters
         filtered_df = apply_filters(df, filters)
@@ -236,12 +251,12 @@ with tabs[0]:
                 width="stretch",
                 column_config={k: v for k, v in column_config.items() if k in available_columns},
                 num_rows="dynamic",
-                key=f"editor_{category}",
+                key=f"editor_{category}_search",
                 disabled=["map"]  # Prevent editing of map column
             )
 
             # Save edited rows to database
-            if st.button("Save Changes", key=f"save_{category}"):
+            if st.button("Save Changes", key=f"save_{category}_search"):
                 try:
                     for idx, row in edited_df.iterrows():
                         row_data = row.to_dict()
@@ -315,7 +330,20 @@ for i in range(1, 5):
             cols = st.columns(len(available_columns))
             for idx, col in enumerate(available_columns):
                 with cols[idx]:
-                    filters[col] = st.text_input(f"Filter {col.replace('_', ' ').title()}", key=f"filter_{col}_{category}")
+                    if col in ["keyword", "location", "source", "status"]:
+                        # Dropdown filter with unique values
+                        unique_values = [""] + sorted(df[col].dropna().astype(str).unique().tolist())  # Include empty option
+                        filters[col] = st.selectbox(
+                            f"Filter {col.replace('_', ' ').title()}",
+                            options=unique_values,
+                            key=f"filter_{col}_{category}"
+                        )
+                    else:
+                        # Text input for other columns
+                        filters[col] = st.text_input(
+                            f"Filter {col.replace('_', ' ').title()}",
+                            key=f"filter_{col}_{category}"
+                        )
 
             # Apply filters
             filtered_df = apply_filters(df, filters)

@@ -1,0 +1,13 @@
+2025-10-22 09:17:59,465 - INFO - ====== WebDriver manager ======
+2025-10-22 09:17:59,651 - INFO - Get LATEST chromedriver version for google-chrome
+2025-10-22 09:17:59,878 - INFO - Get LATEST chromedriver version for google-chrome
+2025-10-22 09:18:00,060 - INFO - Driver [/home/amatyalabs-3/.wdm/drivers/chromedriver/linux64/131.0.6778.264/chromedriver-linux64/chromedriver] found in cache
+2025-10-22 09:18:00,965 - INFO - Driver initialized successfully
+2025-10-22 09:18:01,031 - INFO - Scraping URL: https://www.realestate.com.au/rent/in-all+adelaide+sa/list-1?activeSort=price-asc
+2025-10-22 09:18:01,040 - ERROR - Error accessing https://www.realestate.com.au/rent/in-all+adelaide+sa/list-1?activeSort=price-asc: 'WebDriver' object has no attribute 'on'
+2025-10-22 09:18:01,489 - INFO - Page source saved to page_source.html
+2025-10-22 09:18:01,490 - WARNING - Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<urllib3.connection.HTTPConnection object at 0x7b9978ebb890>: Failed to establish a new connection: [Errno 111] Connection refused')': /session/066ef3d2e43e9ae1c68bedcea3800fa2
+2025-10-22 09:18:01,491 - WARNING - Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<urllib3.connection.HTTPConnection object at 0x7b99496bb6e0>: Failed to establish a new connection: [Errno 111] Connection refused')': /session/066ef3d2e43e9ae1c68bedcea3800fa2
+2025-10-22 09:18:01,491 - WARNING - Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<urllib3.connection.HTTPConnection object at 0x7b997afb9370>: Failed to establish a new connection: [Errno 111] Connection refused')': /session/066ef3d2e43e9ae1c68bedcea3800fa2
+2025-10-22 09:18:01,492 - WARNING - No results found during scraping
+2025-10-22 09:18:01,492 - WARNING - No results found during scraping.
